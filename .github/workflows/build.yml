@@ -102,9 +102,9 @@ jobs:
 
           dependencies {
               implementation("org.nanohttpd:nanohttpd:2.3.1")
-              implementation("org.smali:dexlib2:2.5.2")
-              implementation("org.smali:baksmali:2.5.2")
-              implementation("org.smali:util:2.5.2")
+              implementation("org.smali:dexlib2:2.4.0")
+              implementation("org.smali:baksmali:2.4.0")
+              implementation("org.smali:util:2.4.0")
           }
           __REA_EOF__
           mkdir -p app/src/main
@@ -496,7 +496,7 @@ jobs:
                               for (insn in impl.instructions) {
                                   if (insn is ReferenceInstruction) {
                                       val r: String = try {
-                                          ReferenceUtil.getReferenceString(insn.reference)
+                                          ReferenceUtil.getReferenceString(insn.reference) ?: ""
                                       } catch (e: Exception) {
                                           ""
                                       }

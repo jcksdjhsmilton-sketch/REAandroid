@@ -30,7 +30,8 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.10.2
+          gradle-version: '8.13'
+          cache-disabled: true
 
       - name: Restaurar keystore (mantem a mesma assinatura entre builds)
         uses: actions/cache@v4
@@ -38,10 +39,10 @@ jobs:
           path: ~/.android/debug.keystore
           key: rea-debug-keystore-v1
 
-      - name: Aceitar licencas e instalar plataforma Android 35
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0" >/dev/null 2>&1 || true
+      - name: Instalar Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;35.0.0'
 
       - name: Gerar projeto Android (todos os arquivos)
         run: |
@@ -57,7 +58,7 @@ jobs:
 
           android {
               namespace = "app.rea.android"
-              compileSdk = 35
+              compileSdk = 36
 
               defaultConfig {
                   applicationId = "app.rea.android"
@@ -79,8 +80,7 @@ jobs:
                   sourceCompatibility = JavaVersion.VERSION_17
                   targetCompatibility = JavaVersion.VERSION_17
               }
-              kotlinOptions { jvmTarget = "17" }
-
+    
               lint {
                   abortOnError = false
                   checkReleaseBuilds = false
@@ -1956,8 +1956,8 @@ jobs:
           __REA_EOF__
           cat > build.gradle.kts <<'__REA_EOF__'
           plugins {
-              id("com.android.application") version "8.7.3" apply false
-              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("com.android.application") version "8.11.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.2.20" apply false
           }
           __REA_EOF__
           cat > gradle.properties <<'__REA_EOF__'
@@ -2006,19 +2006,31 @@ jobs:
 
       - name: Compilar APK
         working-directory: rea-android
-        run: gradle --no-daemon --stacktrace assembleRelease
+        run: |
+          set +e
+          gradle --no-daemon --console=plain assembleDebug > build.log 2>&1
+          code=$?
+          echo "gradle terminou com codigo $code"
+          if [ $code -ne 0 ]; then
+            echo "=============== RESUMO DOS ERROS ==============="
+            grep -E "^e: |What went wrong|Execution failed|Could not|requires|incompatible|Caused by|error:" -A4 build.log | head -n 70
+            echo "------ ultimas linhas ------"
+            tail -n 25 build.log
+            echo "================================================"
+          fi
+          exit $code
 
       - name: Guardar APK como artifact
         uses: actions/upload-artifact@v4
         with:
           name: REA-Android
-          path: rea-android/app/build/outputs/apk/release/app-release.apk
+          path: rea-android/app/build/outputs/apk/debug/app-debug.apk
 
       - name: Publicar APK em Releases (tag latest)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp rea-android/app/build/outputs/apk/release/app-release.apk REA-Android.apk
+          cp rea-android/app/build/outputs/apk/debug/app-debug.apk REA-Android.apk
           gh release delete latest --repo "${{ github.repository }}" --cleanup-tag -y || true
           gh release create latest REA-Android.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" \
             --title "REA Android (latest)" --notes "APK gerado pelo GitHub Actions."

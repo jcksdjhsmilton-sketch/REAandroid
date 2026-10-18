@@ -102,12 +102,8 @@ jobs:
 
           dependencies {
               implementation("org.nanohttpd:nanohttpd:2.3.1")
-              implementation("org.smali:dexlib2:2.4.0")
-              implementation("org.smali:baksmali:2.4.0")
-              implementation("org.smali:util:2.4.0")
-              implementation("org.apktool:apktool-lib:3.0.3") {
-                  exclude(group = "com.github.iBotPeaches.smali")
-              }
+              implementation("com.github.iBotPeaches.smali:smali-baksmali:b6365a84f4")
+              implementation("org.apktool:apktool-lib:3.0.3")
               implementation("com.android.tools.build:apksig:8.7.3")
           }
           __REA_EOF__

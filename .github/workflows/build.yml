@@ -950,9 +950,6 @@ jobs:
 
           import android.content.Context
           import android.os.Environment
-          import brut.androlib.ApkBuilder
-          import brut.androlib.ApkDecoder
-          import brut.androlib.Config
           import com.android.apksig.ApkSigner
           import org.json.JSONObject
           import java.io.File
@@ -960,14 +957,61 @@ jobs:
           import java.security.PrivateKey
           import java.security.cert.X509Certificate
 
-          // Port simplificado do apktool: DECODIFICAR um apk em smali+recursos editaveis,
-          // e RECONSTRUIR + ASSINAR de volta um apk instalavel, usando a debug key do CI
-          // (embutida em res/raw/rea_debug.keystore no passo "Incluir keystore de debug").
+          // Port do apktool: DECODIFICAR um apk em smali+recursos editaveis e RECONSTRUIR + ASSINAR
+          // de volta um apk instalavel (debug key do CI, embutida em res/raw/rea_debug.keystore).
+          // O apktool-lib 3.x mudou a API publica; a integracao usa reflexao para nao depender de
+          // assinaturas exatas. Se algo nao existir, o erro de runtime diz exatamente o que faltou.
           object Edit {
               private fun projectsRoot(ctx: Context): File {
                   val d = File(ctx.getExternalFilesDir(null), "projects")
                   d.mkdirs()
                   return d
+              }
+
+              private fun newConfig(): Any {
+                  val c = Class.forName("brut.androlib.Config")
+                  return try {
+                      c.getMethod("getDefaultConfig").invoke(null)!!
+                  } catch (e: NoSuchMethodException) {
+                      c.getDeclaredConstructor().newInstance()!!
+                  }
+              }
+
+              // Cria objeto com construtor de 2 parametros (Config, File) em qualquer ordem.
+              private fun construct(clsName: String, config: Any, file: File): Any {
+                  val cls = Class.forName(clsName)
+                  for (ctor in cls.constructors) {
+                      val ps = ctor.parameterTypes
+                      if (ps.size != 2) continue
+                      val args = arrayOfNulls<Any>(2)
+                      var ok = true
+                      for (i in 0..1) {
+                          val p = ps[i]
+                          args[i] = when {
+                              p.isInstance(config) -> config
+                              p == File::class.java -> file
+                              p.simpleName == "ExtFile" -> p.getConstructor(File::class.java).newInstance(file)
+                              else -> { ok = false; null }
+                          }
+                      }
+                      if (ok) return ctor.newInstance(*args)
+                  }
+                  throw IllegalStateException("construtor de " + clsName + "(Config, File) nao encontrado nesta versao do apktool-lib")
+              }
+
+              // Chama um metodo de 1 parametro (File ou ExtFile) pelo nome.
+              private fun call(obj: Any, name: String, arg: File): Any? {
+                  for (m in obj.javaClass.methods) {
+                      if (m.name != name || m.parameterTypes.size != 1) continue
+                      val p = m.parameterTypes[0]
+                      val a: Any = when {
+                          p == File::class.java -> arg
+                          p.simpleName == "ExtFile" -> p.getConstructor(File::class.java).newInstance(arg)
+                          else -> continue
+                      }
+                      return m.invoke(obj, a)
+                  }
+                  throw IllegalStateException("metodo " + name + "(File) nao encontrado em " + obj.javaClass.name)
               }
 
               fun decode(ctx: Context, target: Target, projectName: String): JSONObject {
@@ -976,8 +1020,8 @@ jobs:
                   val name = if (projectName.isNotBlank()) projectName else apk.nameWithoutExtension
                   val outDir = File(projectsRoot(ctx), name)
                   if (outDir.exists()) outDir.deleteRecursively()
-                  val config = Config.getDefaultConfig()
-                  ApkDecoder(config, apk).decode(outDir)
+                  val decoder = construct("brut.androlib.ApkDecoder", newConfig(), apk)
+                  call(decoder, "decode", outDir)
                   var count = 0
                   outDir.walkTopDown().forEach { if (it.isFile) count++ }
                   return JSONObject()
@@ -994,8 +1038,8 @@ jobs:
                   outDir.mkdirs()
                   val unsigned = File(outDir, projectName + "-unsigned.apk")
                   if (unsigned.exists()) unsigned.delete()
-                  val config = Config.getDefaultConfig()
-                  ApkBuilder(config, projDir).build(unsigned)
+                  val builder = construct("brut.androlib.ApkBuilder", newConfig(), projDir)
+                  call(builder, "build", unsigned)
                   val signed = File(outDir, projectName + "-signed.apk")
                   if (signed.exists()) signed.delete()
                   signApk(ctx, unsigned, signed)
@@ -1004,11 +1048,11 @@ jobs:
                       .put("project", projectName)
                       .put("apk", signed.absolutePath)
                       .put("sha256", sha256File(signed))
-                      .put("note", "Assinado com a debug key do CI. Abra o arquivo no gerenciador de arquivos para instalar (pode pedir pra permitir 'instalar apps desconhecidos' desse app).")
+                      .put("note", "Assinado com a debug key do CI. Abra o arquivo no gerenciador de arquivos para instalar (pode pedir pra permitir instalar apps desconhecidos).")
               }
 
               private fun signApk(ctx: Context, input: File, output: File) {
-                  val ks = KeyStore.getInstance("JKS")
+                  val ks = KeyStore.getInstance("PKCS12")
                   ctx.resources.openRawResource(R.raw.rea_debug).use { ks.load(it, "android".toCharArray()) }
                   val key = ks.getKey("androiddebugkey", "android".toCharArray()) as PrivateKey
                   val cert = ks.getCertificate("androiddebugkey") as X509Certificate

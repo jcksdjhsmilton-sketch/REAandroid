@@ -102,9 +102,9 @@ jobs:
 
           dependencies {
               implementation("org.nanohttpd:nanohttpd:2.3.1")
-              compileOnly("org.smali:dexlib2:2.4.0")
-              compileOnly("org.smali:baksmali:2.4.0")
-              compileOnly("org.smali:util:2.4.0")
+              implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
+              implementation("com.android.tools.smali:smali-baksmali:3.0.9")
+              implementation("com.android.tools.smali:smali-util:3.0.9")
               implementation("org.apktool:apktool-lib:3.0.3")
               implementation("com.android.tools.build:apksig:8.7.3")
           }
@@ -159,14 +159,14 @@ jobs:
           import android.content.pm.PackageManager
           import android.content.res.Resources
           import android.os.Build
-          import org.jf.baksmali.Adaptors.ClassDefinition
-          import org.jf.baksmali.BaksmaliOptions
-          import org.jf.dexlib2.Opcodes
-          import org.jf.dexlib2.dexbacked.DexBackedDexFile
-          import org.jf.dexlib2.iface.ClassDef
-          import org.jf.dexlib2.iface.instruction.ReferenceInstruction
-          import org.jf.dexlib2.util.ReferenceUtil
-          import org.jf.util.IndentingWriter
+          import com.android.tools.smali.baksmali.Adaptors.ClassDefinition
+          import com.android.tools.smali.baksmali.BaksmaliOptions
+          import com.android.tools.smali.dexlib2.Opcodes
+          import com.android.tools.smali.dexlib2.dexbacked.DexBackedDexFile
+          import com.android.tools.smali.dexlib2.iface.ClassDef
+          import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
+          import com.android.tools.smali.dexlib2.util.ReferenceUtil
+          import com.android.tools.smali.util.IndentingWriter
           import org.json.JSONArray
           import org.json.JSONObject
           import org.xmlpull.v1.XmlPullParser
@@ -243,7 +243,7 @@ jobs:
                   return n.joinToString(" ")
               }
 
-              private fun sig(c: ClassDef, m: org.jf.dexlib2.iface.Method): String =
+              private fun sig(c: ClassDef, m: com.android.tools.smali.dexlib2.iface.Method): String =
                   c.type + "->" + m.name + "(" + m.parameterTypes.joinToString("") + ")" + m.returnType
 
               // ---------- overview / zip ----------

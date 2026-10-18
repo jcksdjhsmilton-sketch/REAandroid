@@ -166,9 +166,9 @@ jobs:
               </application>
           </manifest>
           __REA_EOF__
-          mkdir -p app/src/main/java/app/rea/android
-          cat > app/src/main/java/app/rea/android/Core.kt <<'__REA_EOF__'
-          package app.rea.android
+          mkdir -p app/src/main/java/app/rea/android/decode
+          cat > app/src/main/java/app/rea/android/decode/Core.kt <<'__REA_EOF__'
+          package app.rea.android.decode
 
           import android.content.Context
           import android.content.pm.PackageManager
@@ -362,9 +362,9 @@ jobs:
               }
           }
           __REA_EOF__
-          mkdir -p app/src/main/java/app/rea/android
-          cat > app/src/main/java/app/rea/android/AppState.kt <<'__REA_EOF__'
-          package app.rea.android
+          mkdir -p app/src/main/java/app/rea/android/decode
+          cat > app/src/main/java/app/rea/android/decode/AppState.kt <<'__REA_EOF__'
+          package app.rea.android.decode
 
           import java.text.SimpleDateFormat
           import java.util.Date
@@ -399,9 +399,9 @@ jobs:
               }
           }
           __REA_EOF__
-          mkdir -p app/src/main/java/app/rea/android
-          cat > app/src/main/java/app/rea/android/Edit.kt <<'__REA_EOF__'
-          package app.rea.android
+          mkdir -p app/src/main/java/app/rea/android/decode
+          cat > app/src/main/java/app/rea/android/decode/Edit.kt <<'__REA_EOF__'
+          package app.rea.android.decode
 
           import android.content.Context
           import android.os.Environment
@@ -549,9 +549,9 @@ jobs:
               }
           }
           __REA_EOF__
-          mkdir -p app/src/main/java/app/rea/android
-          cat > app/src/main/java/app/rea/android/MainActivity.kt <<'__REA_EOF__'
-          package app.rea.android
+          mkdir -p app/src/main/java/app/rea/android/decode
+          cat > app/src/main/java/app/rea/android/decode/MainActivity.kt <<'__REA_EOF__'
+          package app.rea.android.decode
 
           import android.Manifest
           import android.app.Activity
@@ -775,9 +775,9 @@ jobs:
               }
           }
           __REA_EOF__
-          mkdir -p app/src/main/java/app/rea/android
-          cat > app/src/main/java/app/rea/android/McpHttpServer.kt <<'__REA_EOF__'
-          package app.rea.android
+          mkdir -p app/src/main/java/app/rea/android/decode
+          cat > app/src/main/java/app/rea/android/decode/McpHttpServer.kt <<'__REA_EOF__'
+          package app.rea.android.decode
 
           import fi.iki.elonen.NanoHTTPD
           import fi.iki.elonen.NanoHTTPD.IHTTPSession
@@ -923,9 +923,9 @@ jobs:
               }
           }
           __REA_EOF__
-          mkdir -p app/src/main/java/app/rea/android
-          cat > app/src/main/java/app/rea/android/McpService.kt <<'__REA_EOF__'
-          package app.rea.android
+          mkdir -p app/src/main/java/app/rea/android/decode
+          cat > app/src/main/java/app/rea/android/decode/McpService.kt <<'__REA_EOF__'
+          package app.rea.android.decode
 
           import android.app.Notification
           import android.app.NotificationChannel
@@ -1041,9 +1041,9 @@ jobs:
               }
           }
           __REA_EOF__
-          mkdir -p app/src/main/java/app/rea/android
-          cat > app/src/main/java/app/rea/android/Tools.kt <<'__REA_EOF__'
-          package app.rea.android
+          mkdir -p app/src/main/java/app/rea/android/decode
+          cat > app/src/main/java/app/rea/android/decode/Tools.kt <<'__REA_EOF__'
+          package app.rea.android.decode
 
           import android.content.Context
           import org.json.JSONArray
@@ -1117,9 +1117,9 @@ jobs:
               fun find(n: String): Tool? = tools.firstOrNull { it.name == n }
           }
           __REA_EOF__
-          mkdir -p app/src/main/java/app/rea/android
-          cat > app/src/main/java/app/rea/android/Tunnel.kt <<'__REA_EOF__'
-          package app.rea.android
+          mkdir -p app/src/main/java/app/rea/android/decode
+          cat > app/src/main/java/app/rea/android/decode/Tunnel.kt <<'__REA_EOF__'
+          package app.rea.android.decode
 
           import android.content.Context
           import java.io.BufferedReader

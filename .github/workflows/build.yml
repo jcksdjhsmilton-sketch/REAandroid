@@ -105,7 +105,9 @@ jobs:
               implementation("com.android.tools.smali:smali-dexlib2:3.0.9")
               implementation("com.android.tools.smali:smali-baksmali:3.0.9")
               implementation("com.android.tools.smali:smali-util:3.0.9")
-              implementation("org.apktool:apktool-lib:3.0.3")
+              implementation("org.apktool:apktool-lib:3.0.3") {
+                  exclude(group = "com.github.iBotPeaches.smali")
+              }
               implementation("com.android.tools.build:apksig:8.7.3")
           }
           __REA_EOF__
@@ -166,7 +168,7 @@ jobs:
           import com.android.tools.smali.dexlib2.iface.ClassDef
           import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
           import com.android.tools.smali.dexlib2.util.ReferenceUtil
-          import com.android.tools.smali.util.IndentingWriter
+          import com.android.tools.smali.baksmali.formatter.BaksmaliWriter
           import org.json.JSONArray
           import org.json.JSONObject
           import org.xmlpull.v1.XmlPullParser
@@ -449,7 +451,7 @@ jobs:
               fun classSmali(path: String, cls: String, max: Int): String {
                   val (dexName, c) = findClass(path, cls)
                   val sw = StringWriter()
-                  ClassDefinition(BaksmaliOptions(), c).writeTo(IndentingWriter(sw))
+                  ClassDefinition(BaksmaliOptions(), c).writeTo(BaksmaliWriter(sw))
                   var s = sw.toString()
                   val total = s.length
                   if (s.length > max) s = s.take(max) + "\n# ...[truncado: $total chars no total]"

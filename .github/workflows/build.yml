@@ -105,6 +105,8 @@ jobs:
               implementation("org.smali:dexlib2:2.4.0")
               implementation("org.smali:baksmali:2.4.0")
               implementation("org.smali:util:2.4.0")
+              implementation("org.apktool:apktool-lib:3.0.3")
+              implementation("com.android.tools.build:apksig:8.7.3")
           }
           __REA_EOF__
           mkdir -p app/src/main
@@ -933,6 +935,93 @@ jobs:
                       db.close()
                   }
               }
+
+              fun writeFile(path: String, content: String, append: Boolean): JSONObject {
+                  val f = File(path)
+                  f.parentFile?.mkdirs()
+                  if (append) f.appendText(content) else f.writeText(content)
+                  return JSONObject().put("path", f.absolutePath).put("bytes", f.length())
+              }
+          }
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/Edit.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import android.content.Context
+          import android.os.Environment
+          import brut.androlib.ApkBuilder
+          import brut.androlib.ApkDecoder
+          import brut.androlib.Config
+          import com.android.apksig.ApkSigner
+          import org.json.JSONObject
+          import java.io.File
+          import java.security.KeyStore
+          import java.security.PrivateKey
+          import java.security.cert.X509Certificate
+
+          // Port simplificado do apktool: DECODIFICAR um apk em smali+recursos editaveis,
+          // e RECONSTRUIR + ASSINAR de volta um apk instalavel, usando a debug key do CI
+          // (embutida em res/raw/rea_debug.keystore no passo "Incluir keystore de debug").
+          object Edit {
+              private fun projectsRoot(ctx: Context): File {
+                  val d = File(ctx.getExternalFilesDir(null), "projects")
+                  d.mkdirs()
+                  return d
+              }
+
+              fun decode(ctx: Context, target: Target, projectName: String): JSONObject {
+                  val apk = File(target.path)
+                  if (!apk.exists()) throw IllegalArgumentException("apk nao encontrado: " + target.path)
+                  val name = if (projectName.isNotBlank()) projectName else apk.nameWithoutExtension
+                  val outDir = File(projectsRoot(ctx), name)
+                  if (outDir.exists()) outDir.deleteRecursively()
+                  val config = Config.getDefaultConfig()
+                  ApkDecoder(config, apk).decode(outDir)
+                  var count = 0
+                  outDir.walkTopDown().forEach { if (it.isFile) count++ }
+                  return JSONObject()
+                      .put("project", name)
+                      .put("path", outDir.absolutePath)
+                      .put("files", count)
+                      .put("hint", "Use list_dir/inspect_file para navegar e write_file para editar (smali/*, res/*, AndroidManifest.xml). Depois chame apk_build com project=\"" + name + "\".")
+              }
+
+              fun build(ctx: Context, projectName: String): JSONObject {
+                  val projDir = File(projectsRoot(ctx), projectName)
+                  if (!projDir.isDirectory) throw IllegalArgumentException("projeto nao encontrado: " + projectName + " (rode apk_decode primeiro)")
+                  val outDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "REA-builds")
+                  outDir.mkdirs()
+                  val unsigned = File(outDir, projectName + "-unsigned.apk")
+                  if (unsigned.exists()) unsigned.delete()
+                  val config = Config.getDefaultConfig()
+                  ApkBuilder(config, projDir).build(unsigned)
+                  val signed = File(outDir, projectName + "-signed.apk")
+                  if (signed.exists()) signed.delete()
+                  signApk(ctx, unsigned, signed)
+                  unsigned.delete()
+                  return JSONObject()
+                      .put("project", projectName)
+                      .put("apk", signed.absolutePath)
+                      .put("sha256", sha256File(signed))
+                      .put("note", "Assinado com a debug key do CI. Abra o arquivo no gerenciador de arquivos para instalar (pode pedir pra permitir 'instalar apps desconhecidos' desse app).")
+              }
+
+              private fun signApk(ctx: Context, input: File, output: File) {
+                  val ks = KeyStore.getInstance("JKS")
+                  ctx.resources.openRawResource(R.raw.rea_debug).use { ks.load(it, "android".toCharArray()) }
+                  val key = ks.getKey("androiddebugkey", "android".toCharArray()) as PrivateKey
+                  val cert = ks.getCertificate("androiddebugkey") as X509Certificate
+                  val signerConfig = ApkSigner.SignerConfig.Builder("REA", key, listOf(cert)).build()
+                  ApkSigner.Builder(listOf(signerConfig))
+                      .setInputApk(input)
+                      .setOutputApk(output)
+                      .setV1SigningEnabled(true)
+                      .setV2SigningEnabled(true)
+                      .setV3SigningEnabled(true)
+                      .build()
+                      .sign()
+              }
           }
           __REA_EOF__
           mkdir -p app/src/main/java/app/rea/android
@@ -1741,7 +1830,23 @@ jobs:
                   Tool(
                       "analyze_website", "Fetch a page and its scripts; list scripts, links, endpoints/URLs and source maps found in the JavaScript.",
                       listOf(Param("url", "string", "page URL", true))
-                  ) { Web.analyze(it.s("url")) }
+                  ) { Web.analyze(it.s("url")) },
+                  Tool(
+                      "write_file", "Write or overwrite a text file (used to edit files from apk_decode: smali, res/*.xml, AndroidManifest.xml, etc).",
+                      listOf(
+                          Param("path", "string", "absolute file path", true),
+                          Param("content", "string", "new full text content", true),
+                          Param("append", "boolean", "append instead of overwrite (default false)")
+                      )
+                  ) { Core.writeFile(it.s("path"), it.s("content"), it.b("append", false)) },
+                  Tool(
+                      "apk_decode", "Decode (unpack) an APK into editable sources (smali code + resources), apktool-style. Returns the project folder; browse with list_dir, read with inspect_file, edit with write_file.",
+                      listOf(pTarget, Param("project", "string", "name for the project folder (default: apk filename)"))
+                  ) { Edit.decode(ctx, tgt(it), it.s("project")) },
+                  Tool(
+                      "apk_build", "Rebuild an edited apk_decode project back into a signed, installable APK, saved to Download/REA-builds.",
+                      listOf(Param("project", "string", "project name used in apk_decode", true))
+                  ) { Edit.build(ctx, it.s("project")) }
               )
 
               fun find(n: String): Tool? = tools.firstOrNull { it.name == n }
@@ -1984,6 +2089,18 @@ jobs:
           rootProject.name = "rea-android"
           include(":app")
           __REA_EOF__
+
+      - name: Incluir keystore de debug no app (assinar APKs editados no celular)
+        run: |
+          set -e
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -v -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10950 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          mkdir -p rea-android/app/src/main/res/raw
+          cp "$HOME/.android/debug.keystore" rea-android/app/src/main/res/raw/rea_debug.keystore
 
       - name: Compilar cloudflared para Android arm64 (tunel embutido)
         run: |

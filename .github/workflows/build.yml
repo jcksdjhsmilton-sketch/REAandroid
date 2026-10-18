@@ -2077,6 +2077,7 @@ jobs:
                   google()
                   mavenCentral()
                   gradlePluginPortal()
+                  maven { url = uri("https://jitpack.io") }
               }
           }
           dependencyResolutionManagement {
@@ -2084,6 +2085,7 @@ jobs:
               repositories {
                   google()
                   mavenCentral()
+                  maven { url = uri("https://jitpack.io") }
               }
           }
           rootProject.name = "rea-android"

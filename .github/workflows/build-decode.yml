@@ -1,0 +1,1293 @@
+name: Build REA Android APK (Conector Decode)
+
+# Como usar: salve este arquivo como .github/workflows/build-decode.yml no seu repositorio
+# (o nome do arquivo importa: o gatilho "push" abaixo so dispara para este caminho).
+# Va em Actions > "Build REA Android APK (Conector Decode)" > Run workflow.
+# O APK sai em Releases (tag "latest-decode") e tambem como artifact "REA-Android-Decode".
+#
+# Este workflow e INDEPENDENTE do build-decode principal: gera um segundo app Android,
+# com applicationId proprio (app.rea.android.decode), que roda seu PROPRIO servidor MCP
+# e seu PROPRIO tunel Cloudflare, expondo um conector separado que so tem as ferramentas
+# de decodificar/editar/recompilar um APK (apktool-style). Nao inclui as ferramentas de
+# leitura de dex/elf/web do app "REA Android" completo -- isso mantem esse conector menor,
+# mais rapido de compilar e com uma superficie de ferramentas enxuta e dedicada.
+#
+# Ferramentas expostas neste conector:
+#   device_info  - info do aparelho + se "acesso a todos os arquivos" esta concedido
+#   apk_decode   - decodifica (desempacota) um APK em smali + recursos editaveis
+#   list_dir     - navega pastas do projeto decodificado (ou qualquer pasta legivel)
+#   inspect_file - inspeciona um arquivo (info/hex/strings/texto)
+#   write_file   - edita um arquivo de texto (smali, res/*.xml, AndroidManifest.xml...)
+#   apk_build    - recompila o projeto editado de volta em um APK assinado e instalavel
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths: ['.github/workflows/build-decode.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  build-decode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+          cache-disabled: true
+
+      - name: Restaurar keystore (mantem a mesma assinatura entre builds)
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: rea-debug-keystore-v1
+
+      - name: Instalar Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-36 build-tools;35.0.0'
+
+      - name: Gerar projeto Android (todos os arquivos)
+        run: |
+          set -e
+          mkdir -p rea-android-decode
+          cd rea-android-decode
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__REA_EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "app.rea.android.decode"
+              compileSdk = 36
+
+              defaultConfig {
+                  applicationId = "app.rea.android.decode"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "0.1.0"
+                  ndk { abiFilters += "arm64-v8a" }
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                      signingConfig = signingConfigs.getByName("debug")
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+    
+              lint {
+                  abortOnError = false
+                  checkReleaseBuilds = false
+              }
+
+              packaging {
+                  jniLibs {
+                      useLegacyPackaging = true
+                      keepDebugSymbols += "**/libcloudflared.so"
+                  }
+                  resources {
+                      excludes += setOf(
+                          "META-INF/AL2.0", "META-INF/LGPL2.1", "META-INF/DEPENDENCIES",
+                          "META-INF/LICENSE*", "META-INF/NOTICE*", "META-INF/INDEX.LIST"
+                      )
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("org.nanohttpd:nanohttpd:2.3.1")
+              implementation("org.apktool:apktool-lib:3.0.3") {
+                  exclude(group = "com.github.iBotPeaches.smali")
+              }
+              implementation("com.android.tools.build:apksig:8.7.3")
+          }
+          __REA_EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__REA_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+              <application
+                  android:label="REA Decode"
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".McpService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="local_mcp_server_and_tunnel" />
+                  </service>
+              </application>
+          </manifest>
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/Core.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Environment
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.io.File
+          import java.io.InputStream
+          import java.security.MessageDigest
+
+          class Target(val path: String, val pkg: String?)
+
+          fun sha256(b: ByteArray): String =
+              MessageDigest.getInstance("SHA-256").digest(b).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+
+          fun sha256File(f: File): String {
+              val md = MessageDigest.getInstance("SHA-256")
+              f.inputStream().use { ins ->
+                  val buf = ByteArray(65536)
+                  while (true) {
+                      val n = ins.read(buf)
+                      if (n < 0) break
+                      md.update(buf, 0, n)
+                  }
+              }
+              return md.digest().joinToString("") { "%02x".format(it.toInt() and 0xff) }
+          }
+
+          fun readRange(ins: InputStream, off: Long, len: Int): ByteArray {
+              var skipped = 0L
+              while (skipped < off) {
+                  val s = ins.skip(off - skipped)
+                  if (s <= 0) {
+                      if (ins.read() < 0) break
+                      skipped++
+                  } else {
+                      skipped += s
+                  }
+              }
+              val buf = ByteArray(len)
+              var n = 0
+              while (n < len) {
+                  val r = ins.read(buf, n, len - n)
+                  if (r < 0) break
+                  n += r
+              }
+              return buf.copyOf(n)
+          }
+
+          object Fmt {
+              fun render(b: ByteArray, mode: String, base: Long, minLen: Int): String = when (mode) {
+                  "hex" -> hex(b, base)
+                  "strings" -> strings(b, minLen)
+                  else -> {
+                      val s = String(b, Charsets.UTF_8)
+                      val bad = s.count { it == '\uFFFD' || (it < ' ' && it != '\n' && it != '\r' && it != '\t') }
+                      val warn = if (s.isNotEmpty() && bad > s.length / 10) "[aviso: parece binario; use mode=hex ou strings]\n" else ""
+                      warn + s
+                  }
+              }
+
+              fun hex(b: ByteArray, base: Long): String {
+                  val sb = StringBuilder()
+                  var i = 0
+                  while (i < b.size) {
+                      sb.append("%08x  ".format(base + i))
+                      val end = minOf(i + 16, b.size)
+                      for (j in i until i + 16) {
+                          if (j < end) sb.append("%02x ".format(b[j].toInt() and 0xff)) else sb.append("   ")
+                      }
+                      sb.append(" |")
+                      for (j in i until end) {
+                          val c = b[j].toInt() and 0xff
+                          sb.append(if (c in 32..126) c.toChar() else '.')
+                      }
+                      sb.append("|\n")
+                      i += 16
+                  }
+                  return sb.toString()
+              }
+
+              fun strings(b: ByteArray, minLen: Int): String {
+                  val sb = StringBuilder()
+                  var start = -1
+                  var lines = 0
+                  for (i in 0..b.size) {
+                      val c = if (i < b.size) (b[i].toInt() and 0xff) else 0
+                      val printable = c in 32..126 || c == 9
+                      if (printable) {
+                          if (start < 0) start = i
+                      } else {
+                          if (start >= 0 && i - start >= minLen) {
+                              sb.append(start).append(": ").append(String(b, start, i - start, Charsets.ISO_8859_1)).append('\n')
+                              lines++
+                              if (lines >= 5000) return sb.append("...[limite de linhas]").toString()
+                          }
+                          start = -1
+                      }
+                  }
+                  return sb.toString()
+              }
+
+              fun magic(b: ByteArray): String {
+                  fun st(vararg x: Int): Boolean = b.size >= x.size && x.indices.all { (b[it].toInt() and 0xff) == x[it] }
+                  return when {
+                      st(0x7f, 0x45, 0x4c, 0x46) -> "ELF"
+                      st(0x50, 0x4b, 3, 4) -> "ZIP/APK/JAR"
+                      st(0x64, 0x65, 0x78, 0x0a) -> "DEX"
+                      st(0x53, 0x51, 0x4c, 0x69) -> "SQLite3"
+                      st(0x00, 0x61, 0x73, 0x6d) -> "WebAssembly"
+                      st(0x89, 0x50, 0x4e, 0x47) -> "PNG"
+                      st(0x25, 0x50, 0x44, 0x46) -> "PDF"
+                      st(0x03, 0x00, 0x08, 0x00) -> "Android binary XML"
+                      st(0x1f, 0x8b) -> "gzip"
+                      st(0x4d, 0x5a) -> "PE/DOS (MZ)"
+                      st(0xfe, 0xed, 0xfa, 0xce) || st(0xcf, 0xfa, 0xed, 0xfe) -> "Mach-O"
+                      else -> "desconhecido"
+                  }
+              }
+          }
+
+          object Core {
+              fun resolve(ctx: Context, t: String): Target {
+                  require(t.isNotBlank()) { "target vazio" }
+                  if (t.startsWith("/")) {
+                      val f = File(t)
+                      require(f.exists()) { "arquivo nao existe: $t" }
+                      require(f.canRead()) { "sem permissao para ler $t (conceda 'acesso a todos os arquivos' ao app)" }
+                      return Target(t, null)
+                  }
+                  try {
+                      val ai = ctx.packageManager.getApplicationInfo(t, 0)
+                      return Target(ai.sourceDir, t)
+                  } catch (e: PackageManager.NameNotFoundException) {
+                      throw IllegalArgumentException("pacote nao instalado: $t")
+                  }
+              }
+
+              fun deviceInfo(ctx: Context): JSONObject {
+                  val allFiles = if (Build.VERSION.SDK_INT >= 30) Environment.isExternalStorageManager() else true
+                  return JSONObject()
+                      .put("manufacturer", Build.MANUFACTURER)
+                      .put("model", Build.MODEL)
+                      .put("android", Build.VERSION.RELEASE)
+                      .put("sdk", Build.VERSION.SDK_INT)
+                      .put("abis", JSONArray(Build.SUPPORTED_ABIS.toList()))
+                      .put("allFilesAccess", allFiles)
+                      .put("externalStorage", Environment.getExternalStorageDirectory().absolutePath)
+                      .put("appFilesDir", ctx.filesDir.absolutePath)
+              }
+
+              fun inspectFile(a: JSONObject): Any {
+                  val f = File(a.s("path"))
+                  require(f.exists()) { "arquivo nao existe" }
+                  require(f.isFile) { "nao e um arquivo" }
+                  require(f.canRead()) { "sem permissao de leitura (conceda acesso a todos os arquivos)" }
+                  val mode = a.s("mode", "info")
+                  val off = a.i("offset", 0).toLong()
+                  val len = minOf(a.i("length", 4096), 131072)
+                  if (mode == "info") {
+                      val head = f.inputStream().use { readRange(it, 0, 16) }
+                      val o = JSONObject().put("path", f.absolutePath).put("size", f.length())
+                          .put("modified", f.lastModified()).put("magic", Fmt.magic(head))
+                      if (f.length() < 600L * 1024 * 1024) o.put("sha256", sha256File(f))
+                      return o
+                  }
+                  val bytes = f.inputStream().use { readRange(it, off, len) }
+                  return Fmt.render(bytes, mode, off, a.i("min_len", 6))
+              }
+
+              fun listDir(path: String, limit: Int): JSONObject {
+                  val d = File(path)
+                  require(d.isDirectory) { "nao e um diretorio: $path" }
+                  val list = d.listFiles() ?: throw IllegalArgumentException("sem permissao para listar $path")
+                  val arr = JSONArray()
+                  for (f in list.sortedBy { it.name.lowercase() }.take(limit)) {
+                      arr.put(
+                          JSONObject().put("name", f.name).put("dir", f.isDirectory)
+                              .put("size", if (f.isFile) f.length() else JSONObject.NULL).put("modified", f.lastModified())
+                      )
+                  }
+                  return JSONObject().put("path", path).put("total", list.size).put("entries", arr)
+              }
+
+              fun writeFile(path: String, content: String, append: Boolean): JSONObject {
+                  val f = File(path)
+                  f.parentFile?.mkdirs()
+                  if (append) f.appendText(content) else f.writeText(content)
+                  return JSONObject().put("path", f.absolutePath).put("bytes", f.length())
+              }
+          }
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/AppState.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object AppState {
+              @Volatile var running = false
+              @Volatile var publicBase: String? = null
+              @Volatile var token = ""
+              @Volatile var listener: (() -> Unit)? = null
+
+              private val logs = ArrayDeque<String>()
+              private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+
+              @Synchronized
+              fun log(msg: String) {
+                  logs.addLast(fmt.format(Date()) + "  " + msg)
+                  while (logs.size > 250) logs.removeFirst()
+                  listener?.invoke()
+              }
+
+              @Synchronized
+              fun logText(): String = logs.joinToString("\n")
+
+              fun changed() {
+                  listener?.invoke()
+              }
+
+              fun connectorUrl(): String? {
+                  val b = publicBase ?: return null
+                  return b.trimEnd('/') + "/mcp/" + token
+              }
+          }
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/Edit.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import android.content.Context
+          import android.os.Environment
+          import com.android.apksig.ApkSigner
+          import org.json.JSONObject
+          import java.io.File
+          import java.security.KeyStore
+          import java.security.PrivateKey
+          import java.security.cert.X509Certificate
+
+          // Port do apktool: DECODIFICAR um apk em smali+recursos editaveis e RECONSTRUIR + ASSINAR
+          // de volta um apk instalavel (debug key do CI, embutida em res/raw/rea_debug.keystore).
+          // O apktool-lib 3.x mudou a API publica; a integracao usa reflexao para nao depender de
+          // assinaturas exatas. Se algo nao existir, o erro de runtime diz exatamente o que faltou.
+          object Edit {
+              private fun projectsRoot(ctx: Context): File {
+                  val d = File(ctx.getExternalFilesDir(null), "projects")
+                  d.mkdirs()
+                  return d
+              }
+
+                  private fun describe(c: Class<*>): String {
+                  val sb = StringBuilder(c.name + " ctors=")
+                  for (k in c.declaredConstructors) sb.append(k.parameterTypes.joinToString(",", "(", ")") { it.simpleName })
+                  sb.append(" statics=")
+                  for (m in c.declaredMethods) if (java.lang.reflect.Modifier.isStatic(m.modifiers)) sb.append(m.name + m.parameterTypes.joinToString(",", "(", ")") { it.simpleName } + ":" + m.returnType.simpleName + " ")
+                  return sb.toString()
+              }
+
+              private fun defaultFor(t: Class<*>): Any? = when {
+                  t == String::class.java -> "3.0.3"
+                  t == java.lang.Boolean.TYPE || t == java.lang.Boolean::class.java -> false
+                  t == Integer.TYPE || t == java.lang.Integer::class.java -> 0
+                  t == java.lang.Long.TYPE -> 0L
+                  else -> null
+              }
+
+              // apktool-lib 3.x mudou como criar Config: tenta metodos estaticos sem argumento que
+              // retornam Config, depois qualquer construtor preenchendo parametros com valores padrao.
+              private fun newConfig(): Any {
+                  val c = Class.forName("brut.androlib.Config")
+                  for (m in c.declaredMethods) {
+                      if (java.lang.reflect.Modifier.isStatic(m.modifiers) && m.parameterTypes.isEmpty() && c.isAssignableFrom(m.returnType)) {
+                          try { m.isAccessible = true; val r = m.invoke(null); if (r != null) return r } catch (e: Exception) { }
+                      }
+                  }
+                  for (k in c.declaredConstructors.sortedBy { it.parameterTypes.size }) {
+                      try {
+                          k.isAccessible = true
+                          val args = k.parameterTypes.map { defaultFor(it) }.toTypedArray()
+                          return k.newInstance(*args)
+                      } catch (e: Exception) { }
+                  }
+                  throw IllegalStateException("nao consegui criar Config. API: " + describe(c))
+              }
+
+          // Cria objeto com construtor de 2 parametros (Config, File) em qualquer ordem.
+              private fun construct(clsName: String, config: Any, file: File): Any {
+                  val cls = Class.forName(clsName)
+                  for (ctor in cls.constructors) {
+                      val ps = ctor.parameterTypes
+                      if (ps.size != 2) continue
+                      val args = arrayOfNulls<Any>(2)
+                      var ok = true
+                      for (i in 0..1) {
+                          val p = ps[i]
+                          args[i] = when {
+                              p.isInstance(config) -> config
+                              p == File::class.java -> file
+                              p.simpleName == "ExtFile" -> p.getConstructor(File::class.java).newInstance(file)
+                              else -> { ok = false; null }
+                          }
+                      }
+                      if (ok) { try { return ctor.newInstance(*args) } catch (e: java.lang.reflect.InvocationTargetException) { throw (e.targetException ?: e) } }
+                  }
+                  throw IllegalStateException("construtor de " + clsName + "(Config, File) nao encontrado nesta versao do apktool-lib")
+              }
+
+              // Chama um metodo de 1 parametro (File ou ExtFile) pelo nome.
+              private fun call(obj: Any, name: String, arg: File): Any? {
+                  for (m in obj.javaClass.methods) {
+                      if (m.name != name || m.parameterTypes.size != 1) continue
+                      val p = m.parameterTypes[0]
+                      val a: Any = when {
+                          p == File::class.java -> arg
+                          p.simpleName == "ExtFile" -> p.getConstructor(File::class.java).newInstance(arg)
+                          else -> continue
+                      }
+                      try { return m.invoke(obj, a) } catch (e: java.lang.reflect.InvocationTargetException) { throw (e.targetException ?: e) }
+                  }
+                  throw IllegalStateException("metodo " + name + "(File) nao encontrado em " + obj.javaClass.name)
+              }
+
+              fun decode(ctx: Context, target: Target, projectName: String): JSONObject {
+                  val apk = File(target.path)
+                  if (!apk.exists()) throw IllegalArgumentException("apk nao encontrado: " + target.path)
+                  val name = if (projectName.isNotBlank()) projectName else apk.nameWithoutExtension
+                  val outDir = File(projectsRoot(ctx), name)
+                  if (outDir.exists()) outDir.deleteRecursively()
+                  val decoder = construct("brut.androlib.ApkDecoder", newConfig(), apk)
+                  call(decoder, "decode", outDir)
+                  var count = 0
+                  outDir.walkTopDown().forEach { if (it.isFile) count++ }
+                  return JSONObject()
+                      .put("project", name)
+                      .put("path", outDir.absolutePath)
+                      .put("files", count)
+                      .put("hint", "Use list_dir/inspect_file para navegar e write_file para editar (smali/*, res/*, AndroidManifest.xml). Depois chame apk_build com project=\"" + name + "\".")
+              }
+
+              fun build(ctx: Context, projectName: String): JSONObject {
+                  val projDir = File(projectsRoot(ctx), projectName)
+                  if (!projDir.isDirectory) throw IllegalArgumentException("projeto nao encontrado: " + projectName + " (rode apk_decode primeiro)")
+                  val outDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "REA-builds")
+                  outDir.mkdirs()
+                  val unsigned = File(outDir, projectName + "-unsigned.apk")
+                  if (unsigned.exists()) unsigned.delete()
+                  val builder = construct("brut.androlib.ApkBuilder", newConfig(), projDir)
+                  call(builder, "build", unsigned)
+                  val signed = File(outDir, projectName + "-signed.apk")
+                  if (signed.exists()) signed.delete()
+                  signApk(ctx, unsigned, signed)
+                  unsigned.delete()
+                  return JSONObject()
+                      .put("project", projectName)
+                      .put("apk", signed.absolutePath)
+                      .put("sha256", sha256File(signed))
+                      .put("note", "Assinado com a debug key do CI. Abra o arquivo no gerenciador de arquivos para instalar (pode pedir pra permitir instalar apps desconhecidos).")
+              }
+
+              private fun signApk(ctx: Context, input: File, output: File) {
+                  val ks = KeyStore.getInstance("PKCS12")
+                  ctx.resources.openRawResource(R.raw.rea_debug).use { ks.load(it, "android".toCharArray()) }
+                  val key = ks.getKey("androiddebugkey", "android".toCharArray()) as PrivateKey
+                  val cert = ks.getCertificate("androiddebugkey") as X509Certificate
+                  val signerConfig = ApkSigner.SignerConfig.Builder("REA", key, listOf(cert)).build()
+                  ApkSigner.Builder(listOf(signerConfig))
+                      .setInputApk(input)
+                      .setOutputApk(output)
+                      .setV1SigningEnabled(true)
+                      .setV2SigningEnabled(true)
+                      .setV3SigningEnabled(true)
+                      .build()
+                      .sign()
+              }
+          }
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/MainActivity.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.graphics.Typeface
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.View
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Spinner
+          import android.widget.TextView
+          import android.widget.Toast
+          import java.security.SecureRandom
+
+          class MainActivity : Activity() {
+              private lateinit var prefs: SharedPreferences
+              private lateinit var tvStatus: TextView
+              private lateinit var tvUrl: TextView
+              private lateinit var tvLog: TextView
+              private lateinit var btnToggle: Button
+              private lateinit var spMode: Spinner
+              private lateinit var etCf: EditText
+              private lateinit var etHost: EditText
+              private lateinit var etPort: EditText
+              private val ui = Handler(Looper.getMainLooper())
+
+              private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+              private fun label(t: String, size: Float = 14f, bold: Boolean = false): TextView {
+                  val v = TextView(this)
+                  v.text = t
+                  v.textSize = size
+                  if (bold) v.setTypeface(null, Typeface.BOLD)
+                  v.setPadding(0, dp(8), 0, dp(4))
+                  return v
+              }
+
+              private fun button(t: String, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = t
+                  b.isAllCaps = false
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun newToken() {
+                  val b = ByteArray(24)
+                  SecureRandom().nextBytes(b)
+                  val t = b.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+                  prefs.edit().putString("token", t).apply()
+                  AppState.token = t
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  prefs = getSharedPreferences("rea", MODE_PRIVATE)
+                  if ((prefs.getString("token", "") ?: "").isEmpty()) newToken()
+                  AppState.token = prefs.getString("token", "") ?: ""
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(dp(16), dp(28), dp(16), dp(24))
+
+                  root.addView(label("REA Decode", 24f, true))
+                  root.addView(label("Conector MCP dedicado a decodificar/editar/recompilar APKs, rodando no celular. O Claude (site/app) conecta nele pela URL abaixo."))
+
+                  tvStatus = label("", 16f, true)
+                  root.addView(tvStatus)
+                  btnToggle = button("Iniciar") { toggle() }
+                  root.addView(btnToggle)
+
+                  root.addView(label("URL do conector (cole em Claude > Configuracoes > Conectores > Adicionar conector personalizado):", 13f))
+                  tvUrl = TextView(this)
+                  tvUrl.setTextIsSelectable(true)
+                  tvUrl.textSize = 13f
+                  tvUrl.typeface = Typeface.MONOSPACE
+                  root.addView(tvUrl)
+                  root.addView(button("Copiar URL") {
+                      val u = AppState.connectorUrl()
+                      if (u == null) {
+                          Toast.makeText(this, "Ainda sem URL publica", Toast.LENGTH_SHORT).show()
+                      } else {
+                          val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                          cm.setPrimaryClip(ClipData.newPlainText("rea", u))
+                          Toast.makeText(this, "Copiado", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+
+                  root.addView(label("Tunel", 16f, true))
+                  spMode = Spinner(this)
+                  val modes = arrayOf(
+                      "Cloudflare rapido (automatico, URL muda a cada inicio)",
+                      "Cloudflare nomeado (token + dominio, URL fixa)",
+                      "URL publica manual (tunel feito por fora)"
+                  )
+                  spMode.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, modes)
+                  spMode.setSelection(prefs.getInt("mode", 0))
+                  spMode.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+                      override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
+                          etCf.visibility = if (pos == 1) View.VISIBLE else View.GONE
+                          etHost.visibility = if (pos >= 1) View.VISIBLE else View.GONE
+                      }
+                      override fun onNothingSelected(p: AdapterView<*>?) {}
+                  }
+                  root.addView(spMode)
+                  etCf = EditText(this)
+                  etCf.hint = "Token do tunel Cloudflare"
+                  etCf.setText(prefs.getString("cf_token", ""))
+                  root.addView(etCf)
+                  etHost = EditText(this)
+                  etHost.hint = "Dominio publico (ex: rea.meudominio.com)"
+                  etHost.setText(prefs.getString("host", ""))
+                  root.addView(etHost)
+                  etPort = EditText(this)
+                  etPort.hint = "Porta local"
+                  etPort.inputType = InputType.TYPE_CLASS_NUMBER
+                  etPort.setText(prefs.getInt("port", 8766).toString())
+                  root.addView(etPort)
+
+                  root.addView(label("Permissoes", 16f, true))
+                  root.addView(button("Dar acesso a todos os arquivos") {
+                      if (Build.VERSION.SDK_INT >= 30) {
+                          startActivity(
+                              Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))
+                          )
+                      }
+                  })
+                  root.addView(button("Ignorar otimizacao de bateria") {
+                      try {
+                          startActivity(
+                              Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+                          )
+                      } catch (e: Exception) {
+                          Toast.makeText(this, "Nao foi possivel abrir", Toast.LENGTH_SHORT).show()
+                      }
+                  })
+                  root.addView(button("Gerar novo token (invalida a URL antiga)") {
+                      newToken()
+                      AppState.log("novo token gerado; reinicie o servidor e atualize o conector")
+                      refresh()
+                  })
+
+                  root.addView(label("Log", 16f, true))
+                  tvLog = TextView(this)
+                  tvLog.textSize = 11f
+                  tvLog.typeface = Typeface.MONOSPACE
+                  tvLog.setTextIsSelectable(true)
+                  root.addView(tvLog)
+
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  AppState.listener = { ui.post { refresh() } }
+                  refresh()
+              }
+
+              private fun savePrefs() {
+                  val port = etPort.text.toString().toIntOrNull() ?: 8766
+                  prefs.edit()
+                      .putInt("mode", spMode.selectedItemPosition)
+                      .putString("cf_token", etCf.text.toString().trim())
+                      .putString("host", etHost.text.toString().trim())
+                      .putInt("port", port)
+                      .apply()
+              }
+
+              private fun toggle() {
+                  savePrefs()
+                  if (AppState.running) {
+                      startService(Intent(this, McpService::class.java).setAction("stop"))
+                  } else {
+                      startForegroundService(Intent(this, McpService::class.java).setAction("start"))
+                  }
+                  ui.postDelayed({ refresh() }, 600)
+              }
+
+              private fun refresh() {
+                  val st = if (AppState.running) {
+                      if (AppState.publicBase == null) "Servidor ativo (aguardando o tunel...)" else "Servidor ativo"
+                  } else {
+                      "Parado"
+                  }
+                  tvStatus.text = st
+                  btnToggle.text = if (AppState.running) "Parar" else "Iniciar"
+                  tvUrl.text = AppState.connectorUrl() ?: "(a URL aparece aqui quando o tunel subir)"
+                  tvLog.text = AppState.logText()
+              }
+
+              override fun onPause() {
+                  savePrefs()
+                  super.onPause()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  AppState.listener = { ui.post { refresh() } }
+                  refresh()
+              }
+
+              override fun onDestroy() {
+                  AppState.listener = null
+                  super.onDestroy()
+              }
+          }
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/McpHttpServer.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import fi.iki.elonen.NanoHTTPD
+          import fi.iki.elonen.NanoHTTPD.IHTTPSession
+          import fi.iki.elonen.NanoHTTPD.Method
+          import fi.iki.elonen.NanoHTTPD.Response
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          class RpcError(val code: Int, msg: String) : Exception(msg)
+
+          const val INSTRUCTIONS = "REA Decode: connector dedicated to decoding (unpacking) an APK into editable smali code + " +
+              "resources, editing it, and rebuilding it back into a signed, installable APK -- apktool-style, running ON the user's phone. " +
+              "Typical workflow: apk_decode(target) where target is an installed package name or an absolute .apk path -> " +
+              "list_dir / inspect_file to browse the decoded project -> write_file to edit smali/res/*.xml/AndroidManifest.xml -> " +
+              "apk_build(project) to get the rebuilt, re-signed APK in Download/REA-builds. device_info reports whether " +
+              "all-files access is granted (needed to read arbitrary paths and to write the rebuilt APK to Downloads). " +
+              "Only decode, edit or rebuild software the user owns or is authorized to modify."
+
+          class McpHttpServer(
+              port: Int,
+              private val token: String,
+              private val registry: ToolRegistry
+          ) : NanoHTTPD("127.0.0.1", port) {
+
+              private val versions = listOf("2025-06-18", "2025-03-26", "2024-11-05")
+
+              override fun serve(session: IHTTPSession): Response {
+                  val uri = session.uri ?: "/"
+                  if (uri == "/health") return plain(Response.Status.OK, "ok")
+                  val auth = session.headers["authorization"] ?: ""
+                  val authorized = uri == "/mcp/$token" || (uri == "/mcp" && auth == "Bearer $token")
+                  if (!authorized) return plain(Response.Status.NOT_FOUND, "not found")
+                  return when (session.method) {
+                      Method.POST -> post(session)
+                      Method.DELETE -> plain(Response.Status.OK, "")
+                      Method.OPTIONS -> plain(Response.Status.NO_CONTENT, "")
+                      else -> plain(Response.Status.METHOD_NOT_ALLOWED, "use POST")
+                  }
+              }
+
+              private fun plain(st: Response.Status, s: String): Response =
+                  NanoHTTPD.newFixedLengthResponse(st, "text/plain", s)
+
+              private fun json(s: String): Response =
+                  NanoHTTPD.newFixedLengthResponse(Response.Status.OK, "application/json", s)
+
+              private fun post(session: IHTTPSession): Response {
+                  val files = HashMap<String, String>()
+                  try {
+                      session.parseBody(files)
+                  } catch (e: Exception) {
+                      return plain(Response.Status.BAD_REQUEST, "bad body")
+                  }
+                  val body = (files["postData"] ?: "").trim()
+                  if (body.isEmpty()) return plain(Response.Status.BAD_REQUEST, "empty body")
+                  return try {
+                      if (body.startsWith("[")) {
+                          val arr = JSONArray(body)
+                          val out = JSONArray()
+                          for (i in 0 until arr.length()) {
+                              val r = handle(arr.getJSONObject(i))
+                              if (r != null) out.put(r)
+                          }
+                          if (out.length() == 0) plain(Response.Status.ACCEPTED, "") else json(out.toString())
+                      } else {
+                          val r = handle(JSONObject(body))
+                          if (r == null) plain(Response.Status.ACCEPTED, "") else json(r.toString())
+                      }
+                  } catch (e: Exception) {
+                      json(errorObj(null, -32700, "parse error: " + e.message).toString())
+                  }
+              }
+
+              private fun errorObj(id: Any?, code: Int, msg: String): JSONObject =
+                  JSONObject().put("jsonrpc", "2.0").put("id", id ?: JSONObject.NULL)
+                      .put("error", JSONObject().put("code", code).put("message", msg))
+
+              private fun handle(m: JSONObject): JSONObject? {
+                  if (!m.has("method")) return null
+                  val method = m.getString("method")
+                  if (!m.has("id")) return null
+                  val id = m.get("id")
+                  return try {
+                      val params = m.optJSONObject("params") ?: JSONObject()
+                      val result: Any = when (method) {
+                          "initialize" -> initialize(params)
+                          "ping" -> JSONObject()
+                          "tools/list" -> {
+                              val arr = JSONArray()
+                              for (t in registry.tools) {
+                                  arr.put(
+                                      JSONObject().put("name", t.name).put("description", t.desc)
+                                          .put("inputSchema", t.schema())
+                                  )
+                              }
+                              JSONObject().put("tools", arr)
+                          }
+                          "tools/call" -> call(params)
+                          "resources/list" -> JSONObject().put("resources", JSONArray())
+                          "prompts/list" -> JSONObject().put("prompts", JSONArray())
+                          else -> throw RpcError(-32601, "Method not found: $method")
+                      }
+                      JSONObject().put("jsonrpc", "2.0").put("id", id).put("result", result)
+                  } catch (e: RpcError) {
+                      errorObj(id, e.code, e.message ?: "error")
+                  } catch (e: Exception) {
+                      errorObj(id, -32603, e.message ?: "internal error")
+                  }
+              }
+
+              private fun initialize(p: JSONObject): JSONObject {
+                  val req = p.optString("protocolVersion")
+                  val v = if (req in versions) req else versions[0]
+                  AppState.log("cliente MCP conectou (protocolo $v)")
+                  return JSONObject()
+                      .put("protocolVersion", v)
+                      .put("capabilities", JSONObject().put("tools", JSONObject().put("listChanged", false)))
+                      .put("serverInfo", JSONObject().put("name", "rea-android-decode").put("version", "0.1.0"))
+                      .put("instructions", INSTRUCTIONS)
+              }
+
+              private fun call(p: JSONObject): JSONObject {
+                  val name = p.optString("name")
+                  val tool = registry.find(name) ?: throw RpcError(-32602, "Unknown tool: $name")
+                  val args = p.optJSONObject("arguments") ?: JSONObject()
+                  var isErr = false
+                  AppState.log("tool: $name")
+                  var text = try {
+                      when (val r = tool.fn(args)) {
+                          is JSONObject -> r.toString(2)
+                          is JSONArray -> r.toString(2)
+                          null -> "ok"
+                          else -> r.toString()
+                      }
+                  } catch (e: Throwable) {
+                      isErr = true
+                      "Erro: " + e.javaClass.simpleName + ": " + (e.message ?: "")
+                  }
+                  if (text.length > 120000) text = text.take(120000) + "\n...[saida truncada; use filtros/offset/limit]"
+                  return JSONObject()
+                      .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", text)))
+                      .put("isError", isErr)
+              }
+          }
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/McpService.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.IBinder
+          import android.os.PowerManager
+          import fi.iki.elonen.NanoHTTPD
+
+          class McpService : Service() {
+              private var server: McpHttpServer? = null
+              private var tunnel: Tunnel? = null
+              private var wl: PowerManager.WakeLock? = null
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  if (intent?.action == "stop") {
+                      shutdown()
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  startFg("Iniciando...")
+                  Thread { boot() }.start()
+                  return START_STICKY
+              }
+
+              private fun startFg(text: String) {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("rea", "REA Decode", NotificationManager.IMPORTANCE_LOW))
+                  val pi = PendingIntent.getActivity(
+                      this, 0, Intent(this, MainActivity::class.java),
+                      PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  )
+                  val n: Notification = Notification.Builder(this, "rea")
+                      .setSmallIcon(android.R.drawable.stat_notify_sync)
+                      .setContentTitle("REA Decode ativo")
+                      .setContentText(text)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  } else {
+                      startForeground(1, n)
+                  }
+              }
+
+              private fun boot() {
+                  synchronized(this) {
+                      if (server != null) return
+                      val p = getSharedPreferences("rea", MODE_PRIVATE)
+                      val port = p.getInt("port", 8766)
+                      val token = p.getString("token", "") ?: ""
+                      AppState.token = token
+                      try {
+                          val s = McpHttpServer(port, token, ToolRegistry(applicationContext))
+                          s.start(NanoHTTPD.SOCKET_READ_TIMEOUT, false)
+                          server = s
+                          AppState.running = true
+                          AppState.log("servidor MCP em 127.0.0.1:$port")
+                      } catch (e: Exception) {
+                          AppState.log("falha ao abrir porta $port: ${e.message}")
+                          AppState.running = false
+                          AppState.changed()
+                          return
+                      }
+                      val pm = getSystemService(PowerManager::class.java)
+                      wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "rea:server").apply { acquire() }
+                      AppState.changed()
+                      val t = Tunnel(this)
+                      tunnel = t
+                      t.start(
+                          p.getInt("mode", 0), port,
+                          p.getString("cf_token", "") ?: "",
+                          p.getString("host", "") ?: ""
+                      ) { url ->
+                          AppState.publicBase = url
+                          AppState.log("URL publica: $url")
+                          AppState.changed()
+                      }
+                  }
+              }
+
+              private fun shutdown() {
+                  synchronized(this) {
+                      tunnel?.stop()
+                      tunnel = null
+                      try {
+                          server?.stop()
+                      } catch (e: Exception) {
+                      }
+                      server = null
+                      try {
+                          wl?.let { if (it.isHeld) it.release() }
+                      } catch (e: Exception) {
+                      }
+                      wl = null
+                  }
+                  AppState.running = false
+                  AppState.publicBase = null
+                  AppState.log("servidor parado")
+                  AppState.changed()
+              }
+
+              override fun onDestroy() {
+                  shutdown()
+                  super.onDestroy()
+              }
+          }
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/Tools.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          class Param(val name: String, val type: String, val desc: String, val required: Boolean = false)
+
+          class Tool(val name: String, val desc: String, val params: List<Param>, val fn: (JSONObject) -> Any?) {
+              fun schema(): JSONObject {
+                  val props = JSONObject()
+                  val req = JSONArray()
+                  for (p in params) {
+                      props.put(p.name, JSONObject().put("type", p.type).put("description", p.desc))
+                      if (p.required) req.put(p.name)
+                  }
+                  return JSONObject().put("type", "object").put("properties", props).put("required", req)
+              }
+          }
+
+          fun JSONObject.s(k: String, d: String = ""): String = if (has(k) && !isNull(k)) optString(k, d) else d
+          fun JSONObject.i(k: String, d: Int): Int = if (has(k) && !isNull(k)) optInt(k, d) else d
+          fun JSONObject.b(k: String, d: Boolean): Boolean = if (has(k) && !isNull(k)) optBoolean(k, d) else d
+
+          // Registro ENXUTO, dedicado apenas ao fluxo de decodificar/editar/recompilar um APK.
+          // Nao inclui as ferramentas de leitura de dex/elf/web do app "REA Android" completo.
+          class ToolRegistry(private val ctx: Context) {
+              private val pTarget = Param(
+                  "target", "string",
+                  "Package name of an installed app (e.g. com.example.app) OR absolute path to an .apk file readable by this app",
+                  true
+              )
+
+              private fun tgt(a: JSONObject): Target = Core.resolve(ctx, a.s("target"))
+
+              val tools: List<Tool> = listOf(
+                  Tool("device_info", "Info about the Android device running this server and whether all-files access is granted.", listOf()) {
+                      Core.deviceInfo(ctx)
+                  },
+                  Tool(
+                      "apk_decode", "Decode (unpack) an APK into editable sources (smali code + resources), apktool-style. Returns the project folder; browse with list_dir, read with inspect_file, edit with write_file.",
+                      listOf(pTarget, Param("project", "string", "name for the project folder (default: apk filename)"))
+                  ) { Edit.decode(ctx, tgt(it), it.s("project")) },
+                  Tool(
+                      "list_dir", "List a directory (needs all-files access for shared storage). Use it to browse an apk_decode project.",
+                      listOf(Param("path", "string", "absolute directory path", true), Param("limit", "integer", "default 300"))
+                  ) { Core.listDir(it.s("path"), it.i("limit", 300)) },
+                  Tool(
+                      "inspect_file", "Inspect any readable file: info (size, magic, sha256), hex, strings or text. Use it to read a decoded project's files.",
+                      listOf(
+                          Param("path", "string", "absolute file path", true),
+                          Param("mode", "string", "info | hex | strings | text (default info)"),
+                          Param("offset", "integer", "default 0"),
+                          Param("length", "integer", "default 4096, max 131072"),
+                          Param("min_len", "integer", "min string length for strings mode (default 6)")
+                      )
+                  ) { Core.inspectFile(it) },
+                  Tool(
+                      "write_file", "Write or overwrite a text file (used to edit files from apk_decode: smali, res/*.xml, AndroidManifest.xml, etc).",
+                      listOf(
+                          Param("path", "string", "absolute file path", true),
+                          Param("content", "string", "new full text content", true),
+                          Param("append", "boolean", "append instead of overwrite (default false)")
+                      )
+                  ) { Core.writeFile(it.s("path"), it.s("content"), it.b("append", false)) },
+                  Tool(
+                      "apk_build", "Rebuild an edited apk_decode project back into a signed, installable APK, saved to Download/REA-builds.",
+                      listOf(Param("project", "string", "project name used in apk_decode", true))
+                  ) { Edit.build(ctx, it.s("project")) }
+              )
+
+              fun find(n: String): Tool? = tools.firstOrNull { it.name == n }
+          }
+          __REA_EOF__
+          mkdir -p app/src/main/java/app/rea/android
+          cat > app/src/main/java/app/rea/android/Tunnel.kt <<'__REA_EOF__'
+          package app.rea.android
+
+          import android.content.Context
+          import java.io.BufferedReader
+          import java.io.File
+          import java.io.InputStreamReader
+
+          class Tunnel(private val ctx: Context) {
+              private var proc: Process? = null
+
+              private fun normalize(h: String): String {
+                  val t = h.trim().trimEnd('/')
+                  if (t.isEmpty()) return ""
+                  return if (t.startsWith("http://") || t.startsWith("https://")) t else "https://$t"
+              }
+
+              // mode 0 = Cloudflare rapido, 1 = Cloudflare nomeado (token), 2 = URL manual
+              fun start(mode: Int, port: Int, cfToken: String, host: String, onUrl: (String) -> Unit) {
+                  if (mode == 2) {
+                      val u = normalize(host)
+                      if (u.isEmpty()) AppState.log("informe a URL publica no campo de dominio") else onUrl(u)
+                      return
+                  }
+                  val bin = File(ctx.applicationInfo.nativeLibraryDir, "libcloudflared.so")
+                  if (!bin.exists()) {
+                      AppState.log("cloudflared ausente: ${bin.path}")
+                      return
+                  }
+                  val args = arrayListOf(bin.absolutePath, "tunnel", "--no-autoupdate", "--protocol", "http2")
+                  if (mode == 1) {
+                      if (cfToken.isBlank()) {
+                          AppState.log("informe o token do tunel Cloudflare")
+                          return
+                      }
+                      args.addAll(listOf("run", "--token", cfToken.trim()))
+                  } else {
+                      args.addAll(listOf("--url", "http://127.0.0.1:$port"))
+                  }
+                  try {
+                      val pb = ProcessBuilder(args).redirectErrorStream(true)
+                      pb.environment()["HOME"] = ctx.filesDir.absolutePath
+                      pb.environment()["TMPDIR"] = ctx.cacheDir.absolutePath
+                      val p = pb.start()
+                      proc = p
+                      AppState.log("cloudflared iniciado")
+                      if (mode == 1) {
+                          val u = normalize(host)
+                          if (u.isNotEmpty()) onUrl(u) else AppState.log("informe o dominio publico configurado no tunel")
+                      }
+                      Thread {
+                          try {
+                              val re = Regex("https://[a-z0-9-]+\\.trycloudflare\\.com")
+                              BufferedReader(InputStreamReader(p.inputStream)).forEachLine { line ->
+                                  AppState.log("cf: " + line.take(180))
+                                  if (mode == 0) {
+                                      val m = re.find(line)
+                                      if (m != null && !m.value.contains("//api.")) onUrl(m.value)
+                                  }
+                              }
+                          } catch (e: Exception) {
+                              AppState.log("leitura do cloudflared falhou: ${e.message}")
+                          }
+                          AppState.log("cloudflared encerrou")
+                      }.start()
+                  } catch (e: Exception) {
+                      AppState.log("falha ao executar cloudflared: ${e.message}")
+                  }
+              }
+
+              fun stop() {
+                  try {
+                      proc?.destroyForcibly()
+                  } catch (e: Exception) {
+                  }
+                  proc = null
+              }
+          }
+          __REA_EOF__
+          cat > build.gradle.kts <<'__REA_EOF__'
+          plugins {
+              id("com.android.application") version "8.11.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.2.20" apply false
+          }
+          __REA_EOF__
+          cat > gradle.properties <<'__REA_EOF__'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          __REA_EOF__
+          cat > settings.gradle.kts <<'__REA_EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+                  maven { url = uri("https://jitpack.io") }
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+                  maven { url = uri("https://jitpack.io") }
+              }
+          }
+          rootProject.name = "rea-android-decode"
+          include(":app")
+          __REA_EOF__
+
+      - name: Incluir keystore de debug no app (assinar APKs editados no celular)
+        run: |
+          set -e
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -v -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10950 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+          mkdir -p rea-android-decode/app/src/main/res/raw
+          cp "$HOME/.android/debug.keystore" rea-android-decode/app/src/main/res/raw/rea_debug.keystore
+
+      - name: Compilar cloudflared para Android arm64 (tunel embutido)
+        run: |
+          set -x
+          TAG=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" https://api.github.com/repos/cloudflare/cloudflared/releases/latest | jq -r .tag_name)
+          OUT="$GITHUB_WORKSPACE/rea-android-decode/app/src/main/jniLibs/arm64-v8a"
+          mkdir -p "$OUT"
+          git clone --depth 1 --branch "$TAG" https://github.com/cloudflare/cloudflared.git /tmp/cf
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang"
+          ok=0
+          if [ -x "$CC" ]; then
+            (cd /tmp/cf && GOOS=android GOARCH=arm64 CGO_ENABLED=1 CC="$CC" go build -trimpath -ldflags "-s -w" -o "$OUT/libcloudflared.so" ./cmd/cloudflared) && ok=1
+          fi
+          if [ "$ok" != 1 ]; then
+            echo "::warning::build GOOS=android falhou; usando binario linux-arm64 oficial (DNS pode falhar no Android)"
+            curl -fL "https://github.com/cloudflare/cloudflared/releases/download/$TAG/cloudflared-linux-arm64" -o "$OUT/libcloudflared.so"
+          fi
+          ls -la "$OUT"
+
+      - name: Compilar APK
+        working-directory: rea-android-decode
+        run: |
+          set +e
+          gradle --no-daemon --console=plain assembleDebug > build.log 2>&1
+          code=$?
+          echo "gradle terminou com codigo $code"
+          if [ $code -ne 0 ]; then
+            echo "=============== RESUMO DOS ERROS ==============="
+            grep -E "^e: |What went wrong|Execution failed|Could not|requires|incompatible|Caused by|error:" -A4 build.log | head -n 70
+            echo "------ ultimas linhas ------"
+            tail -n 25 build.log
+            echo "================================================"
+          fi
+          exit $code
+
+      - name: Guardar APK como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: REA-Android-Decode
+          path: rea-android-decode/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publicar APK em Releases (tag latest-decode)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp rea-android-decode/app/build/outputs/apk/debug/app-debug.apk REA-Android-Decode.apk
+          gh release delete latest-decode --repo "${{ github.repository }}" --cleanup-tag -y || true
+          gh release create latest-decode REA-Android-Decode.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "REA Android - Decode (latest)" --notes "APK (conector so de apk_decode/apk_build) gerado pelo GitHub Actions."
